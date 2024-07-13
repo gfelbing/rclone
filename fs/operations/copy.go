@@ -55,6 +55,9 @@ func (c *copy) removeFailedCopy(ctx context.Context, o fs.Object) {
 
 // Used to remove a failed partial copy
 func (c *copy) removeFailedPartialCopy(ctx context.Context, f fs.Fs, remote string) {
+	if c.dstFeatures.ResumesPartialUploads {
+		return
+	}
 	o, err := f.NewObject(ctx, remote)
 	if errors.Is(err, fs.ErrorObjectNotFound) {
 		// Assume object has been deleted

@@ -36,6 +36,7 @@ type Features struct {
 	DirModTimeUpdatesOnWrite bool // indicate writing files to a directory updates its modtime
 	FilterAware              bool // can make use of filters if provided for listing
 	PartialUploads           bool // uploaded file can appear incomplete on the fs while it's being uploaded
+	ResumesPartialUploads    bool // partially uploaded files can be resumed, so they are not deleted on abort
 	NoMultiThreading         bool // set if can't have multiplethreads on one download open
 	Overlay                  bool // this wraps one or more backends to add functionality
 	ChunkWriterDoesntSeek    bool // set if the chunk writer doesn't need to read the data more than once
