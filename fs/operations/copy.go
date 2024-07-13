@@ -6,6 +6,8 @@ package operations
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
@@ -20,7 +22,6 @@ import (
 	"github.com/rclone/rclone/fs/hash"
 	"github.com/rclone/rclone/lib/atexit"
 	"github.com/rclone/rclone/lib/pacer"
-	"github.com/rclone/rclone/lib/random"
 )
 
 // State of the copy
@@ -87,7 +88,7 @@ func TruncateString(s string, n int) string {
 }
 
 // Check to see if we should be using a partial name and return the name for the copy and the inplace flag
-func (c *copy) checkPartial() (remoteForCopy string, inplace bool, err error) {
+func (c *copy) checkPartial(ctx context.Context) (remoteForCopy string, inplace bool, err error) {
 	remoteForCopy = c.remote
 	if c.ci.Inplace || c.dstFeatures.Move == nil || !c.dstFeatures.PartialUploads || strings.HasSuffix(c.remote, ".rclonelink") {
 		return remoteForCopy, true, nil
@@ -97,7 +98,12 @@ func (c *copy) checkPartial() (remoteForCopy string, inplace bool, err error) {
 	}
 	// Avoid making the leaf name longer if it's already lengthy to avoid
 	// trouble with file name length limits.
-	suffix := "." + random.String(8) + c.ci.PartialSuffix
+
+	// generate a stable random suffix: use the significant bytes of the hashed remote
+	hashBytes := sha256.Sum256([]byte(fs.Fingerprint(ctx, c.src, true)))
+	hashString := hex.EncodeToString(hashBytes[0:4])
+
+	suffix := "." + hashString + c.ci.PartialSuffix
 	base := path.Base(remoteForCopy)
 	if len(base) > 100 {
 		remoteForCopy = TruncateString(remoteForCopy, len(remoteForCopy)-len(suffix)) + suffix
@@ -400,7 +406,7 @@ func Copy(ctx context.Context, f fs.Fs, dst fs.Object, remote string, src fs.Obj
 	// Are we using partials?
 	//
 	// If so set the flag and update the name we use for the copy
-	c.remoteForCopy, c.inplace, err = c.checkPartial()
+	c.remoteForCopy, c.inplace, err = c.checkPartial(ctx)
 	if err != nil {
 		return nil, err
 	}
