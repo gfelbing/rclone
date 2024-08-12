@@ -5,6 +5,7 @@ package api
 
 import (
 	"fmt"
+	"io"
 	"time"
 )
 
@@ -33,12 +34,26 @@ func (t *Time) UnmarshalJSON(data []byte) error {
 	return nil
 }
 
+// Format returns a textual representation of the time value formatted according
+// to the layout defined by the argument. See [time.Time.Format].
+func (t Time) Format(fmt string) string {
+	return time.Time(t).Format(fmt)
+}
+
 // Error is returned from pcloud when things go wrong
 //
 // If result is 0 then everything is OK
 type Error struct {
 	Result      int    `json:"result"`
 	ErrorString string `json:"error"`
+}
+
+type ResultWithError interface {
+	GetError() Error
+}
+
+type ResultWithData interface {
+	io.ReaderFrom
 }
 
 // Error returns a string for the error and satisfies the error interface
@@ -102,6 +117,10 @@ type ItemResult struct {
 	Metadata Item `json:"metadata"`
 }
 
+func (r *ItemResult) GetError() Error {
+	return r.Error
+}
+
 // Hashes contains the supported hashes
 type Hashes struct {
 	SHA1   string `json:"sha1"`
@@ -117,6 +136,90 @@ type UploadFileResponse struct {
 	Fileids   []int64  `json:"fileids"`
 }
 
+func (r *UploadFileResponse) GetError() Error {
+	return r.Error
+}
+
+// FileTruncateResponse is the response from /file_truncate
+type FileTruncateResponse struct {
+	Error
+}
+
+func (r *FileTruncateResponse) GetError() Error {
+	return r.Error
+}
+
+// FileCloseResponse is the response from /file_close
+type FileCloseResponse struct {
+	Error
+}
+
+func (r *FileCloseResponse) GetError() Error {
+	return r.Error
+}
+
+// FileOpenResponse is the response from /file_open
+type FileOpenResponse struct {
+	Error
+	Fileid         int64  `json:"fileid"`
+	FileDescriptor uint64 `json:"fd"`
+}
+
+func (r *FileOpenResponse) GetError() Error {
+	return r.Error
+}
+
+// FileChecksumResponse is the response from /file_checksum
+type FileChecksumResponse struct {
+	Error
+	MD5    string `json:"md5"`
+	SHA1   string `json:"sha1"`
+	SHA256 string `json:"sha256"`
+}
+
+func (r *FileChecksumResponse) GetError() Error {
+	return r.Error
+}
+
+// FilePWriteResponse is the response from /file_pwrite
+type FilePWriteResponse struct {
+	Error
+	Bytes int64 `json:"bytes"`
+}
+
+func (r *FilePWriteResponse) GetError() Error {
+	return r.Error
+}
+
+// FilePReadResponse is the response from /file_pwrite
+type FilePReadResponse struct {
+	Error
+	Data    []byte
+	DataLen uint64 `json:"data"`
+
+	bytesRead uint64
+}
+
+func (r *FilePReadResponse) GetError() Error {
+	return r.Error
+}
+
+func (r *FilePReadResponse) ReadFrom(in io.Reader) (int64, error) {
+	if r.DataLen == 0 {
+		return 0, nil
+	}
+	data := make([]byte, r.DataLen)
+	n, err := io.ReadFull(in, data)
+	if err != nil {
+		return int64(n), fmt.Errorf("read data: %w", err)
+	}
+	if n != int(r.DataLen) {
+		return int64(n), fmt.Errorf("expected %d data, got %d", n, r.DataLen)
+	}
+	r.Data = data
+	return int64(n), nil
+}
+
 // GetFileLinkResult is returned from /getfilelink
 type GetFileLinkResult struct {
 	Error
@@ -126,6 +229,10 @@ type GetFileLinkResult struct {
 	Expires Time     `json:"expires"`
 	Path    string   `json:"path"`
 	Hosts   []string `json:"hosts"`
+}
+
+func (r *GetFileLinkResult) GetError() Error {
+	return r.Error
 }
 
 // IsValid returns whether the link is valid and has not expired
@@ -153,12 +260,20 @@ type ChecksumFileResult struct {
 	Metadata Item `json:"metadata"`
 }
 
+func (r *ChecksumFileResult) GetError() Error {
+	return r.Error
+}
+
 // PubLinkResult is returned from /getfilepublink and /getfolderpublink
 type PubLinkResult struct {
 	Error
 	LinkID   int    `json:"linkid"`
 	Link     string `json:"link"`
 	LinkCode string `json:"code"`
+}
+
+func (r *PubLinkResult) GetError() Error {
+	return r.Error
 }
 
 // UserInfo is returned from /userinfo
@@ -190,4 +305,8 @@ type UserInfo struct {
 			DownloadDrive bool `json:"downloaddrive"`
 		} `json:"steps"`
 	} `json:"journey"`
+}
+
+func (r *UserInfo) GetError() Error {
+	return r.Error
 }

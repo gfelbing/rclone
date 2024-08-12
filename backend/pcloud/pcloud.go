@@ -14,10 +14,12 @@ import (
 	"net/http"
 	"net/url"
 	"path"
+	"strconv"
 	"strings"
 	"time"
 
 	"github.com/rclone/rclone/backend/pcloud/api"
+	"github.com/rclone/rclone/backend/pcloud/pcloudbinary"
 	"github.com/rclone/rclone/fs"
 	"github.com/rclone/rclone/fs/config"
 	"github.com/rclone/rclone/fs/config/configmap"
@@ -161,31 +163,32 @@ type Options struct {
 
 // Fs represents a remote pcloud
 type Fs struct {
-	name         string             // name of this remote
-	root         string             // the path we are working on
-	opt          Options            // parsed options
-	features     *fs.Features       // optional features
-	srv          *rest.Client       // the connection to the server
-	cleanupSrv   *rest.Client       // the connection used for the cleanup method
-	dirCache     *dircache.DirCache // Map of directory path to directory id
-	pacer        *fs.Pacer          // pacer for API calls
-	tokenRenewer *oauthutil.Renew   // renew the token on expiry
+	name         string                     // name of this remote
+	root         string                     // the path we are working on
+	opt          Options                    // parsed options
+	features     *fs.Features               // optional features
+	client       pcloudbinary.Client        // pcloud binary API client
+	newClient    func() pcloudbinary.Client // pcloud binary API client
+	cleanupSrv   *rest.Client               // the connection used for the cleanup method
+	dirCache     *dircache.DirCache         // Map of directory path to directory id
+	pacer        *fs.Pacer                  // pacer for API calls
+	tokenRenewer *oauthutil.Renew           // renew the token on expiry
 }
 
 // Object describes a pcloud object
 //
 // Will definitely have info but maybe not meta
 type Object struct {
-	fs          *Fs       // what this object is part of
-	remote      string    // The remote path
-	hasMetaData bool      // whether info below has been set
-	size        int64     // size of the object
-	modTime     time.Time // modification time of the object
-	id          string    // ID of the object
-	md5         string    // MD5 if known
-	sha1        string    // SHA1 if known
-	sha256      string    // SHA256 if known
-	link        *api.GetFileLinkResult
+	fs          *Fs                 // what this object is part of
+	client      pcloudbinary.Client // the API client to use for operations on this obj
+	remote      string              // The remote path
+	hasMetaData bool                // whether info below has been set
+	size        int64               // size of the object
+	modTime     time.Time           // modification time of the object
+	id          string              // ID of the object
+	md5         string              // MD5 if known
+	sha1        string              // SHA1 if known
+	sha256      string              // SHA256 if known
 }
 
 // ------------------------------------------------------------
@@ -280,23 +283,6 @@ func (f *Fs) readMetaDataForPath(ctx context.Context, path string) (info *api.It
 	return info, nil
 }
 
-// errorHandler parses a non 2xx error response into an error
-func errorHandler(resp *http.Response) error {
-	// Decode error response
-	errResponse := new(api.Error)
-	err := rest.DecodeJSON(resp, &errResponse)
-	if err != nil {
-		fs.Debugf(nil, "Couldn't decode error response: %v", err)
-	}
-	if errResponse.ErrorString == "" {
-		errResponse.ErrorString = resp.Status
-	}
-	if errResponse.Result == 0 {
-		errResponse.Result = resp.StatusCode
-	}
-	return errResponse
-}
-
 // NewFs constructs an Fs from the path, container:path
 func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, error) {
 	// Parse config into Options struct
@@ -306,19 +292,24 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 		return nil, err
 	}
 	root = parsePath(root)
-	oAuthClient, ts, err := oauthutil.NewClient(ctx, name, m, oauthConfig)
+	_, ts, err := oauthutil.NewClient(ctx, name, m, oauthConfig)
 	if err != nil {
 		return nil, fmt.Errorf("failed to configure Pcloud: %w", err)
 	}
 	updateTokenURL(oauthConfig, opt.Hostname)
 
+	pacer := fs.NewPacer(ctx, pacer.NewDefault(pacer.MinSleep(minSleep), pacer.MaxSleep(maxSleep), pacer.DecayConstant(decayConstant)))
+	newClient := func() pcloudbinary.Client {
+		return pcloudbinary.NewClient(opt.Hostname, ts, pacer)
+	}
 	canCleanup := opt.Username != "" && opt.Password != ""
 	f := &Fs{
-		name:  name,
-		root:  root,
-		opt:   *opt,
-		srv:   rest.NewClient(oAuthClient).SetRoot("https://" + opt.Hostname),
-		pacer: fs.NewPacer(ctx, pacer.NewDefault(pacer.MinSleep(minSleep), pacer.MaxSleep(maxSleep), pacer.DecayConstant(decayConstant))),
+		name:      name,
+		root:      root,
+		opt:       *opt,
+		client:    newClient(),
+		newClient: newClient,
+		pacer:     pacer,
 	}
 	if canCleanup {
 		f.cleanupSrv = rest.NewClient(fshttp.NewClient(ctx)).SetRoot("https://" + opt.Hostname)
@@ -330,7 +321,6 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 	if !canCleanup {
 		f.features.CleanUp = nil
 	}
-	f.srv.SetErrorHandler(errorHandler)
 
 	// Renew the token in the background
 	f.tokenRenewer = oauthutil.NewRenew(f.String(), ts, func() error {
@@ -381,6 +371,7 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 func (f *Fs) newObjectWithInfo(ctx context.Context, remote string, info *api.Item) (fs.Object, error) {
 	o := &Object{
 		fs:     f,
+		client: f.newClient(),
 		remote: remote,
 	}
 	var err error
@@ -417,26 +408,16 @@ func (f *Fs) FindLeaf(ctx context.Context, pathID, leaf string) (pathIDOut strin
 
 // CreateDir makes a directory with pathID as parent and name leaf
 func (f *Fs) CreateDir(ctx context.Context, pathID, leaf string) (newID string, err error) {
-	// fs.Debugf(f, "CreateDir(%q, %q)\n", pathID, leaf)
-	var resp *http.Response
-	var result api.ItemResult
-	opts := rest.Opts{
-		Method:     "POST",
-		Path:       "/createfolder",
-		Parameters: url.Values{},
-	}
-	opts.Parameters.Set("name", f.opt.Enc.FromStandardName(leaf))
-	opts.Parameters.Set("folderid", dirIDtoNumber(pathID))
-	err = f.pacer.Call(func() (bool, error) {
-		resp, err = f.srv.CallJSON(ctx, &opts, nil, &result)
-		err = result.Error.Update(err)
-		return shouldRetry(ctx, resp, err)
-	})
-	if err != nil {
-		//fmt.Printf("...Error %v\n", err)
+	request := pcloudbinary.NewRequest("createfolder")
+	result := &api.ItemResult{}
+
+	request.StringParam("name", f.opt.Enc.FromStandardName(leaf))
+	request.StringParam("folderid", dirIDtoNumber(pathID))
+
+	if err := f.client.Exec(ctx, request, result); err != nil {
 		return "", err
 	}
-	// fmt.Printf("...Id %q\n", *info.Id)
+
 	return result.Metadata.ID, nil
 }
 
@@ -472,26 +453,16 @@ type listAllFn func(*api.Item) bool
 //
 // If the user fn ever returns true then it early exits with found = true
 func (f *Fs) listAll(ctx context.Context, dirID string, directoriesOnly bool, filesOnly bool, recursive bool, fn listAllFn) (found bool, err error) {
-	opts := rest.Opts{
-		Method:     "GET",
-		Path:       "/listfolder",
-		Parameters: url.Values{},
-	}
+	req := pcloudbinary.NewRequest("listfolder")
 	if recursive {
-		opts.Parameters.Set("recursive", "1")
+		req.NumParam("recursive", 1)
 	}
-	opts.Parameters.Set("folderid", dirIDtoNumber(dirID))
-
-	var result api.ItemResult
-	var resp *http.Response
-	err = f.pacer.Call(func() (bool, error) {
-		resp, err = f.srv.CallJSON(ctx, &opts, nil, &result)
-		err = result.Error.Update(err)
-		return shouldRetry(ctx, resp, err)
-	})
-	if err != nil {
+	req.StringParam("folderid", dirIDtoNumber(dirID))
+	result := api.ItemResult{}
+	if err := f.client.Exec(ctx, req, &result); err != nil {
 		return found, fmt.Errorf("couldn't list files: %w", err)
 	}
+
 	var recursiveContents func(is []api.Item, path string)
 	recursiveContents = func(is []api.Item, path string) {
 		for i := range is {
@@ -593,7 +564,7 @@ func (f *Fs) ListR(ctx context.Context, dir string, callback fs.ListRCallback) (
 // Returns the object, leaf, directoryID and error.
 //
 // Used to create new objects
-func (f *Fs) createObject(ctx context.Context, remote string, modTime time.Time, size int64) (o *Object, leaf string, directoryID string, err error) {
+func (f *Fs) createObject(ctx context.Context, remote string, _ time.Time, _ int64) (o *Object, leaf string, directoryID string, err error) {
 	// Create the directory for the object if it doesn't exist
 	leaf, directoryID, err = f.dirCache.FindPath(ctx, remote, true)
 	if err != nil {
@@ -602,6 +573,7 @@ func (f *Fs) createObject(ctx context.Context, remote string, modTime time.Time,
 	// Temporary Object under construction
 	o = &Object{
 		fs:     f,
+		client: f.newClient(),
 		remote: remote,
 	}
 	return o, leaf, directoryID, nil
@@ -643,29 +615,19 @@ func (f *Fs) purgeCheck(ctx context.Context, dir string, check bool) error {
 		return err
 	}
 
-	opts := rest.Opts{
-		Method:     "POST",
-		Path:       "/deletefolder",
-		Parameters: url.Values{},
-	}
-	opts.Parameters.Set("folderid", dirIDtoNumber(rootID))
+	request := pcloudbinary.NewRequest("deletefolder")
+	result := &api.ItemResult{}
+
+	request.StringParam("folderid", dirIDtoNumber(rootID))
 	if !check {
-		opts.Path = "/deletefolderrecursive"
+		request.Method = "deletefolderrecursive"
 	}
-	var resp *http.Response
-	var result api.ItemResult
-	err = f.pacer.Call(func() (bool, error) {
-		resp, err = f.srv.CallJSON(ctx, &opts, nil, &result)
-		err = result.Error.Update(err)
-		return shouldRetry(ctx, resp, err)
-	})
-	if err != nil {
+
+	if err := f.client.Exec(ctx, request, result); err != nil {
 		return fmt.Errorf("rmdir failed: %w", err)
 	}
+
 	f.dirCache.FlushDir(dir)
-	if err != nil {
-		return err
-	}
 	return nil
 }
 
@@ -708,25 +670,17 @@ func (f *Fs) Copy(ctx context.Context, src fs.Object, remote string) (fs.Object,
 	}
 
 	// Copy the object
-	opts := rest.Opts{
-		Method:     "POST",
-		Path:       "/copyfile",
-		Parameters: url.Values{},
-	}
-	opts.Parameters.Set("fileid", fileIDtoNumber(srcObj.id))
-	opts.Parameters.Set("toname", f.opt.Enc.FromStandardName(leaf))
-	opts.Parameters.Set("tofolderid", dirIDtoNumber(directoryID))
-	opts.Parameters.Set("mtime", fmt.Sprintf("%d", uint64(srcObj.modTime.Unix())))
-	var resp *http.Response
-	var result api.ItemResult
-	err = f.pacer.Call(func() (bool, error) {
-		resp, err = f.srv.CallJSON(ctx, &opts, nil, &result)
-		err = result.Error.Update(err)
-		return shouldRetry(ctx, resp, err)
-	})
-	if err != nil {
+	request := pcloudbinary.NewRequest("copyfile")
+	result := &api.ItemResult{}
+
+	request.StringParam("fileid", fileIDtoNumber(srcObj.id))
+	request.StringParam("toname", f.opt.Enc.FromStandardName(leaf))
+	request.StringParam("tofolderid", dirIDtoNumber(directoryID))
+	request.StringParam("mtime", fmt.Sprintf("%d", uint64(srcObj.modTime.Unix())))
+	if err := f.client.Exec(ctx, request, result); err != nil {
 		return nil, err
 	}
+
 	err = dstObj.setMetaData(&result.Metadata)
 	if err != nil {
 		return nil, err
@@ -789,22 +743,14 @@ func (f *Fs) Move(ctx context.Context, src fs.Object, remote string) (fs.Object,
 	}
 
 	// Do the move
-	opts := rest.Opts{
-		Method:     "POST",
-		Path:       "/renamefile",
-		Parameters: url.Values{},
-	}
-	opts.Parameters.Set("fileid", fileIDtoNumber(srcObj.id))
-	opts.Parameters.Set("toname", f.opt.Enc.FromStandardName(leaf))
-	opts.Parameters.Set("tofolderid", dirIDtoNumber(directoryID))
-	var resp *http.Response
-	var result api.ItemResult
-	err = f.pacer.Call(func() (bool, error) {
-		resp, err = f.srv.CallJSON(ctx, &opts, nil, &result)
-		err = result.Error.Update(err)
-		return shouldRetry(ctx, resp, err)
-	})
-	if err != nil {
+	request := pcloudbinary.NewRequest("renamefile")
+	result := &api.ItemResult{}
+
+	request.StringParam("fileid", fileIDtoNumber(srcObj.id))
+	request.StringParam("toname", f.opt.Enc.FromStandardName(leaf))
+	request.StringParam("tofolderid", dirIDtoNumber(directoryID))
+
+	if err := f.client.Exec(ctx, request, result); err != nil {
 		return nil, err
 	}
 
@@ -836,22 +782,14 @@ func (f *Fs) DirMove(ctx context.Context, src fs.Fs, srcRemote, dstRemote string
 	}
 
 	// Do the move
-	opts := rest.Opts{
-		Method:     "POST",
-		Path:       "/renamefolder",
-		Parameters: url.Values{},
-	}
-	opts.Parameters.Set("folderid", dirIDtoNumber(srcID))
-	opts.Parameters.Set("toname", f.opt.Enc.FromStandardName(dstLeaf))
-	opts.Parameters.Set("tofolderid", dirIDtoNumber(dstDirectoryID))
-	var resp *http.Response
-	var result api.ItemResult
-	err = f.pacer.Call(func() (bool, error) {
-		resp, err = f.srv.CallJSON(ctx, &opts, nil, &result)
-		err = result.Error.Update(err)
-		return shouldRetry(ctx, resp, err)
-	})
-	if err != nil {
+	request := pcloudbinary.NewRequest("renamefolder")
+	result := &api.ItemResult{}
+
+	request.StringParam("folderid", dirIDtoNumber(srcID))
+	request.StringParam("toname", f.opt.Enc.FromStandardName(dstLeaf))
+	request.StringParam("tofolderid", dirIDtoNumber(dstDirectoryID))
+
+	if err := f.client.Exec(ctx, request, result); err != nil {
 		return err
 	}
 
@@ -866,22 +804,17 @@ func (f *Fs) DirCacheFlush() {
 }
 
 func (f *Fs) linkDir(ctx context.Context, dirID string, expire fs.Duration) (string, error) {
-	opts := rest.Opts{
-		Method:     "POST",
-		Path:       "/getfolderpublink",
-		Parameters: url.Values{},
-	}
-	var result api.PubLinkResult
-	opts.Parameters.Set("folderid", dirIDtoNumber(dirID))
-	err := f.pacer.Call(func() (bool, error) {
-		resp, err := f.srv.CallJSON(ctx, &opts, nil, &result)
-		err = result.Error.Update(err)
-		return shouldRetry(ctx, resp, err)
-	})
-	if err != nil {
+	request := pcloudbinary.NewRequest("getfolderpublink")
+	result := &api.PubLinkResult{}
+
+	request.StringParam("folderid", dirIDtoNumber(dirID))
+	request.DateTimeParam("expire", time.Now().Add(time.Duration(expire)))
+
+	if err := f.client.Exec(ctx, request, result); err != nil {
 		return "", err
 	}
-	return result.Link, err
+
+	return result.Link, nil
 }
 
 func (f *Fs) linkFile(ctx context.Context, path string, expire fs.Duration) (string, error) {
@@ -890,19 +823,14 @@ func (f *Fs) linkFile(ctx context.Context, path string, expire fs.Duration) (str
 		return "", err
 	}
 	o := obj.(*Object)
-	opts := rest.Opts{
-		Method:     "POST",
-		Path:       "/getfilepublink",
-		Parameters: url.Values{},
-	}
-	var result api.PubLinkResult
-	opts.Parameters.Set("fileid", fileIDtoNumber(o.id))
-	err = f.pacer.Call(func() (bool, error) {
-		resp, err := f.srv.CallJSON(ctx, &opts, nil, &result)
-		err = result.Error.Update(err)
-		return shouldRetry(ctx, resp, err)
-	})
-	if err != nil {
+
+	request := pcloudbinary.NewRequest("getfilepublink")
+	result := &api.PubLinkResult{}
+
+	request.StringParam("fileid", fileIDtoNumber(o.id))
+	request.DateTimeParam("expire", time.Now().Add(time.Duration(expire)))
+
+	if err := f.client.Exec(ctx, request, result); err != nil {
 		return "", err
 	}
 	return result.Link, nil
@@ -922,28 +850,20 @@ func (f *Fs) PublicLink(ctx context.Context, remote string, expire fs.Duration, 
 
 // About gets quota information
 func (f *Fs) About(ctx context.Context) (usage *fs.Usage, err error) {
-	opts := rest.Opts{
-		Method: "POST",
-		Path:   "/userinfo",
-	}
-	var resp *http.Response
-	var q api.UserInfo
-	err = f.pacer.Call(func() (bool, error) {
-		resp, err = f.srv.CallJSON(ctx, &opts, nil, &q)
-		err = q.Error.Update(err)
-		return shouldRetry(ctx, resp, err)
-	})
-	if err != nil {
+	request := pcloudbinary.NewRequest("userinfo")
+	result := &api.UserInfo{}
+
+	if err := f.client.Exec(ctx, request, result); err != nil {
 		return nil, err
 	}
-	free := q.Quota - q.UsedQuota
+	free := result.Quota - result.UsedQuota
 	if free < 0 {
 		free = 0
 	}
 	usage = &fs.Usage{
-		Total: fs.NewUsageValue(q.Quota),     // quota of bytes that can be used
-		Used:  fs.NewUsageValue(q.UsedQuota), // bytes in use
-		Free:  fs.NewUsageValue(free),        // bytes which can be uploaded before reaching the quota
+		Total: fs.NewUsageValue(result.Quota),     // quota of bytes that can be used
+		Used:  fs.NewUsageValue(result.UsedQuota), // bytes in use
+		Free:  fs.NewUsageValue(free),             // bytes which can be uploaded before reaching the quota
 	}
 	return usage, nil
 }
@@ -988,22 +908,15 @@ func (o *Object) Remote() string {
 
 // getHashes fetches the hashes into the object
 func (o *Object) getHashes(ctx context.Context) (err error) {
-	var resp *http.Response
-	var result api.ChecksumFileResult
-	opts := rest.Opts{
-		Method:     "GET",
-		Path:       "/checksumfile",
-		Parameters: url.Values{},
-	}
-	opts.Parameters.Set("fileid", fileIDtoNumber(o.id))
-	err = o.fs.pacer.Call(func() (bool, error) {
-		resp, err = o.fs.srv.CallJSON(ctx, &opts, nil, &result)
-		err = result.Error.Update(err)
-		return shouldRetry(ctx, resp, err)
-	})
-	if err != nil {
+	request := pcloudbinary.NewRequest("checksumfile")
+	result := &api.ChecksumFileResult{}
+
+	request.StringParam("fileid", fileIDtoNumber(o.id))
+
+	if err := o.client.Exec(ctx, request, result); err != nil {
 		return err
 	}
+
 	o.setHashes(&result.Hashes)
 	return o.setMetaData(&result.Metadata)
 }
@@ -1104,57 +1017,103 @@ func (o *Object) Storable() bool {
 	return true
 }
 
-// downloadURL fetches the download link
-func (o *Object) downloadURL(ctx context.Context) (URL string, err error) {
+type fileReader struct {
+	ctx    context.Context
+	client pcloudbinary.Client
+	fd     uint64
+	offset int64
+	count  int64
+}
+
+func newFileReader(ctx context.Context, o *Object, options ...fs.OpenOption) (*fileReader, error) {
 	if o.id == "" {
-		return "", errors.New("can't download - no id")
+		return nil, errors.New("can't download - no id")
 	}
-	if o.link.IsValid() {
-		return o.link.URL(), nil
+
+	var offset int64
+	var count int64
+
+	for _, option := range options {
+		switch x := option.(type) {
+		case *fs.RangeOption:
+			offset, count = x.Decode(o.size)
+			if count < 0 {
+				count = o.size - offset
+			}
+		case *fs.SeekOption:
+			offset = x.Offset
+		default:
+			if option.Mandatory() {
+				fs.Logf(o, "Unsupported mandatory option: %v", option)
+			}
+		}
 	}
-	var resp *http.Response
-	var result api.GetFileLinkResult
-	opts := rest.Opts{
-		Method:     "GET",
-		Path:       "/getfilelink",
-		Parameters: url.Values{},
+	if count == 0 {
+		count = o.size
 	}
-	opts.Parameters.Set("fileid", fileIDtoNumber(o.id))
-	err = o.fs.pacer.Call(func() (bool, error) {
-		resp, err = o.fs.srv.CallJSON(ctx, &opts, nil, &result)
-		err = result.Error.Update(err)
-		return shouldRetry(ctx, resp, err)
-	})
-	if err != nil {
-		return "", err
+
+	request := pcloudbinary.NewRequest("file_open")
+	result := &api.FileOpenResponse{}
+
+	request.StringParam("fileid", fileIDtoNumber(o.id))
+	request.StringParam("flags", "0x0000")
+
+	if err := o.client.Exec(ctx, request, result); err != nil {
+		return nil, fmt.Errorf("open file descriptor: %w", err)
 	}
-	if !result.IsValid() {
-		return "", fmt.Errorf("fetched invalid link %+v", result)
+
+	return &fileReader{
+		ctx:    ctx,
+		client: o.client,
+		fd:     result.FileDescriptor,
+		offset: offset,
+		count:  count,
+	}, nil
+}
+
+func (r *fileReader) Read(p []byte) (int, error) {
+	request := pcloudbinary.NewRequest("file_pread")
+	result := &api.FilePReadResponse{}
+
+	if r.count <= 0 {
+		return 0, io.EOF
 	}
-	o.link = &result
-	return o.link.URL(), nil
+
+	request.StringParam("fd", strconv.FormatInt(int64(r.fd), 10))
+	request.StringParam("offset", strconv.FormatInt(r.offset, 10))
+	request.StringParam("count", strconv.FormatInt(r.count, 10))
+
+	if err := r.client.Exec(r.ctx, request, result); err != nil {
+		return 0, fmt.Errorf("pread: %w", err)
+	}
+
+	if result.DataLen == 0 {
+		return 0, io.EOF
+	}
+
+	n := copy(p, result.Data)
+	r.offset += int64(n)
+	r.count -= int64(n)
+	return n, nil
+}
+
+func (r *fileReader) Close() error {
+	request := pcloudbinary.NewRequest("file_close")
+	result := &api.FilePReadResponse{}
+
+	request.NumParam("fd", r.fd)
+
+	if err := r.client.Exec(r.ctx, request, result); err != nil {
+		return fmt.Errorf("close fd: %w", err)
+	}
+
+	return nil
 }
 
 // Open an object for read
 func (o *Object) Open(ctx context.Context, options ...fs.OpenOption) (in io.ReadCloser, err error) {
-	url, err := o.downloadURL(ctx)
-	if err != nil {
-		return nil, err
-	}
-	var resp *http.Response
-	opts := rest.Opts{
-		Method:  "GET",
-		RootURL: url,
-		Options: options,
-	}
-	err = o.fs.pacer.Call(func() (bool, error) {
-		resp, err = o.fs.srv.Call(ctx, &opts)
-		return shouldRetry(ctx, resp, err)
-	})
-	if err != nil {
-		return nil, err
-	}
-	return resp.Body, err
+	// TODO: use file descriptor
+	return newFileReader(ctx, o, options...)
 }
 
 // Update the object with the contents of the io.Reader, modTime and size
@@ -1180,94 +1139,38 @@ func (o *Object) Update(ctx context.Context, in io.Reader, src fs.ObjectInfo, op
 		return err
 	}
 
-	// Experiments with pcloud indicate that it doesn't like any
-	// form of request which doesn't have a Content-Length.
-	// According to the docs if you close the connection at the
-	// end then it should work without Content-Length, but I
-	// couldn't get this to work using opts.Close (which sets
-	// http.Request.Close).
-	//
-	// This means that chunked transfer encoding needs to be
-	// disabled and a Content-Length needs to be supplied.  This
-	// also rules out streaming.
-	//
-	// Docs: https://docs.pcloud.com/methods/file/uploadfile.html
-	var resp *http.Response
-	var result api.UploadFileResponse
-	opts := rest.Opts{
-		Method:           "PUT",
-		Path:             "/uploadfile",
-		Body:             in,
-		ContentType:      fs.MimeType(ctx, src),
-		ContentLength:    &size,
-		Parameters:       url.Values{},
-		TransferEncoding: []string{"identity"}, // pcloud doesn't like chunked encoding
-		Options:          options,
-	}
+	request := pcloudbinary.NewRequest("uploadfile")
+	result := &api.UploadFileResponse{}
+
 	leaf = o.fs.opt.Enc.FromStandardName(leaf)
-	opts.Parameters.Set("filename", leaf)
-	opts.Parameters.Set("folderid", dirIDtoNumber(directoryID))
-	opts.Parameters.Set("nopartial", "1")
-	opts.Parameters.Set("mtime", fmt.Sprintf("%d", uint64(modTime.Unix())))
+	request.StringParam("filename", leaf)
+	request.StringParam("folderid", dirIDtoNumber(directoryID))
+	request.StringParam("mtime", fmt.Sprintf("%d", uint64(modTime.Unix())))
+	request.NumParam("nopartial", 1)
+	request.Data = in
+	request.DataLen = uint64(size)
 
-	// Special treatment for a 0 length upload.  This doesn't work
-	// with PUT even with Content-Length set (by setting
-	// opts.Body=0), so upload it as a multipart form POST with
-	// Content-Length set.
-	if size == 0 {
-		formReader, contentType, overhead, err := rest.MultipartUpload(ctx, in, opts.Parameters, "content", leaf)
-		if err != nil {
-			return fmt.Errorf("failed to make multipart upload for 0 length file: %w", err)
-		}
-
-		contentLength := overhead + size
-
-		opts.ContentType = contentType
-		opts.Body = formReader
-		opts.Method = "POST"
-		opts.Parameters = nil
-		opts.ContentLength = &contentLength
+	if err := o.client.Exec(ctx, request, result); err != nil {
+		return fmt.Errorf("upload %v: %w", o, err)
 	}
 
-	err = o.fs.pacer.CallNoRetry(func() (bool, error) {
-		resp, err = o.fs.srv.CallJSON(ctx, &opts, nil, &result)
-		err = result.Error.Update(err)
-		return shouldRetry(ctx, resp, err)
-	})
-	if err != nil {
-		// sometimes pcloud leaves a half complete file on
-		// error, so delete it if it exists, trying a few times
-		for i := 0; i < 5; i++ {
-			delObj, delErr := o.fs.NewObject(ctx, o.remote)
-			if delErr == nil && delObj != nil {
-				_ = delObj.Remove(ctx)
-				break
-			}
-			time.Sleep(time.Second)
-		}
-		return err
+	if len(result.Checksums) == 1 {
+		o.setHashes(&result.Checksums[0])
 	}
-	if len(result.Items) != 1 {
-		return fmt.Errorf("failed to upload %v - not sure why", o)
-	}
-	o.setHashes(&result.Checksums[0])
 	return o.setMetaData(&result.Items[0])
 }
 
 // Remove an object
 func (o *Object) Remove(ctx context.Context) error {
-	opts := rest.Opts{
-		Method:     "POST",
-		Path:       "/deletefile",
-		Parameters: url.Values{},
+	request := pcloudbinary.NewRequest("deletefile")
+	result := &api.ItemResult{}
+
+	request.StringParam("fileid", fileIDtoNumber(o.id))
+
+	if err := o.client.Exec(ctx, request, result); err != nil {
+		return fmt.Errorf("delete %v: %w", o, err)
 	}
-	var result api.ItemResult
-	opts.Parameters.Set("fileid", fileIDtoNumber(o.id))
-	return o.fs.pacer.Call(func() (bool, error) {
-		resp, err := o.fs.srv.CallJSON(ctx, &opts, nil, &result)
-		err = result.Error.Update(err)
-		return shouldRetry(ctx, resp, err)
-	})
+	return nil
 }
 
 // ID returns the ID of the Object if known, or "" if not
