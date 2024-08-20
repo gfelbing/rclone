@@ -548,13 +548,49 @@ func (f *Fs) List(ctx context.Context, dir string) (entries fs.DirEntries, err e
 // ListR lists the objects and directories of the Fs starting
 // from dir recursively into out.
 func (f *Fs) ListR(ctx context.Context, dir string, callback fs.ListRCallback) (err error) {
+	var reportContents func(list *walk.ListRHelper, item *api.Item) error
+	reportContents = func(list *walk.ListRHelper, item *api.Item) error {
+		for _, info := range item.Contents {
+			remote := path.Join(dir, info.Name)
+			if info.IsFolder {
+				// cache the directory ID for later lookups
+				f.dirCache.Put(remote, info.ID)
+				d := fs.NewDir(remote, info.ModTime()).SetID(info.ID)
+				if err := list.Add(d); err != nil {
+					return fmt.Errorf("add %s: %w", info.Name, err)
+				}
+				if err := reportContents(list, &info); err != nil {
+					return fmt.Errorf("%s: %w", item.Name, err)
+				}
+			} else {
+				o, err := f.newObjectWithInfo(ctx, remote, &info)
+				if err != nil {
+					return fmt.Errorf("new %s: %w", info.Name, err)
+				}
+				if err := list.Add(o); err != nil {
+					return fmt.Errorf("add %s: %w", info.Name, err)
+				}
+			}
+		}
+		return nil
+	}
+
 	list := walk.NewListRHelper(callback)
-	err = f.listHelper(ctx, dir, true, func(o fs.DirEntry) error {
-		return list.Add(o)
-	})
+	directoryID, err := f.dirCache.FindDir(ctx, dir, false)
 	if err != nil {
 		return err
 	}
+	req := pcloudbinary.NewRequest("listfolder")
+	req.NumParam("recursive", 1)
+	req.StringParam("folderid", dirIDtoNumber(directoryID))
+	result := api.ItemResult{}
+	if err := f.client.Exec(ctx, req, &result); err != nil {
+		return fmt.Errorf("request listfolder: %w", err)
+	}
+	if err := reportContents(list, &result.Metadata); err != nil {
+		return fmt.Errorf("collecting results: %w", err)
+	}
+
 	return list.Flush()
 }
 
