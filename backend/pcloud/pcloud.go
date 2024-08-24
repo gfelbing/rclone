@@ -11,6 +11,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/url"
 	"path"
@@ -418,8 +419,20 @@ func (f *Fs) OpenWriterAt(ctx context.Context, remote string, size int64) (fs.Wr
 // File descriptors are only valid within the same connection and auto-closed when the connection is closed,
 // hence we need a separate client (with single connection) for each fd to avoid all sorts of errors and race conditions.
 func (f *Fs) newSingleConnClient(ctx context.Context) (*rest.Client, error) {
+	var conn net.Conn
 	baseClient := fshttp.NewClient(ctx)
 	baseClient.Transport = fshttp.NewTransportCustom(ctx, func(t *http.Transport) {
+		t.DialContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
+			if conn != nil {
+				return conn, nil
+			}
+			c, err := net.Dial(network, addr)
+			if err != nil {
+				return nil, fmt.Errorf("dial: %w", err)
+			}
+			conn = c
+			return conn, nil
+		}
 		t.MaxConnsPerHost = 1
 		t.DisableKeepAlives = false
 	})
