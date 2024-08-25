@@ -238,7 +238,12 @@ func shouldRetry(ctx context.Context, resp *http.Response, err error) (bool, err
 	doRetry := false
 
 	// Check if it is an api.Error
-	if apiErr, ok := err.(*api.Error); ok {
+	apiErr := &api.Error{}
+	if errors.As(err, &apiErr) {
+		if apiErr.Result == 2055 {
+			// File or folder not found.
+			return false, fmt.Errorf("pcloud api: %w or %w", fs.ErrorDirNotFound, fs.ErrorObjectNotFound)
+		}
 		// See https://docs.pcloud.com/errors/ for error treatment
 		// Errors are classified as 1xxx, 2xxx, etc.
 		switch apiErr.Result / 1000 {
@@ -254,33 +259,6 @@ func shouldRetry(ctx context.Context, resp *http.Response, err error) (bool, err
 		fs.Debugf(nil, "Should retry: %v", err)
 	}
 	return doRetry || fserrors.ShouldRetry(err) || fserrors.ShouldRetryHTTP(resp, retryErrorCodes), err
-}
-
-// readMetaDataForPath reads the metadata from the path
-func (f *Fs) readMetaDataForPath(ctx context.Context, path string) (info *api.Item, err error) {
-	// defer fs.Trace(f, "path=%q", path)("info=%+v, err=%v", &info, &err)
-	leaf, directoryID, err := f.dirCache.FindPath(ctx, path, false)
-	if err != nil {
-		if err == fs.ErrorDirNotFound {
-			return nil, fs.ErrorObjectNotFound
-		}
-		return nil, err
-	}
-
-	found, err := f.listAll(ctx, directoryID, false, true, false, func(item *api.Item) bool {
-		if item.Name == leaf {
-			info = item
-			return true
-		}
-		return false
-	})
-	if err != nil {
-		return nil, err
-	}
-	if !found {
-		return nil, fs.ErrorObjectNotFound
-	}
-	return info, nil
 }
 
 // errorHandler parses a non 2xx error response into an error
@@ -339,7 +317,7 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 
 	// Renew the token in the background
 	f.tokenRenewer = oauthutil.NewRenew(f.String(), f.ts, func() error {
-		_, err := f.readMetaDataForPath(ctx, "")
+		_, err := f.About(ctx)
 		return err
 	})
 
@@ -1121,8 +1099,29 @@ func (o *Object) readMetaData(ctx context.Context) (err error) {
 	if o.hasMetaData {
 		return nil
 	}
-	info, err := o.fs.readMetaDataForPath(ctx, o.remote)
+
+	var resp *http.Response
+	var result api.ItemResult
+	opts := rest.Opts{
+		Method:     "GET",
+		Path:       "/stat",
+		Parameters: url.Values{},
+	}
+	if o.id != "" {
+		opts.Parameters.Set("fileid", fileIDtoNumber(o.id))
+	} else {
+		opts.Parameters.Set("path", path.Join("/", o.fs.Root(), o.remote))
+	}
+	err = o.fs.pacer.Call(func() (bool, error) {
+		resp, err = o.fs.srv.CallJSON(ctx, &opts, nil, &result)
+		err = result.Error.Update(err)
+		return shouldRetry(ctx, resp, err)
+	})
 	if err != nil {
+		if errors.Is(err, fs.ErrorObjectNotFound) {
+			// FIXME: fstests doesn't handle wrapped errors correctly
+			return fs.ErrorObjectNotFound
+		}
 		//if apiErr, ok := err.(*api.Error); ok {
 		// FIXME
 		// if apiErr.Code == "not_found" || apiErr.Code == "trashed" {
@@ -1131,7 +1130,7 @@ func (o *Object) readMetaData(ctx context.Context) (err error) {
 		//}
 		return err
 	}
-	return o.setMetaData(info)
+	return o.setMetaData(&result.Metadata)
 }
 
 // ModTime returns the modification time of the object
