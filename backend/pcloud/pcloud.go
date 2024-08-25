@@ -364,28 +364,11 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 //
 // It truncates any existing object
 func (f *Fs) OpenWriterAt(ctx context.Context, remote string, size int64) (fs.WriterAtCloser, error) {
-	client, err := f.newSingleConnClient(ctx)
-	if err != nil {
-		return nil, fmt.Errorf("create client: %w", err)
-	}
-	// init an empty file
-	leaf, directoryID, err := f.dirCache.FindPath(ctx, remote, true)
-	if err != nil {
-		return nil, fmt.Errorf("resolve src: %w", err)
-	}
-	openResult, err := fileOpenNew(ctx, client, f, directoryID, leaf)
-	if err != nil {
-		return nil, fmt.Errorf("open file: %w", err)
-	}
-
 	writer := &writerAt{
 		ctx:    ctx,
-		client: client,
 		fs:     f,
 		size:   size,
 		remote: remote,
-		fd:     openResult.FileDescriptor,
-		fileID: openResult.Fileid,
 	}
 
 	return writer, nil
@@ -399,6 +382,7 @@ func (f *Fs) newSingleConnClient(ctx context.Context) (*rest.Client, error) {
 	baseClient := fshttp.NewClient(ctx)
 	baseClient.Transport = fshttp.NewTransportCustom(ctx, func(t *http.Transport) {
 		t.MaxConnsPerHost = 1
+		t.MaxIdleConnsPerHost = 1
 		t.DisableKeepAlives = false
 	})
 	// Set our own http client in the context
